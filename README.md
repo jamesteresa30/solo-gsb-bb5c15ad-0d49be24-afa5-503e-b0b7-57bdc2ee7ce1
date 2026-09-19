@@ -3,7 +3,9 @@
 批量提交邮件头信息（`message_id`、`in_reply_to`、`references`、发送时间、主题，
 以及可选的保留截止时间 `retain_until`），服务将其归并为**稳定排序的会话树**，
 并给出**重复 ID、缺失引用、引用环**三类诊断。批次请求与归并结果均持久化到 SQLite，
-可随时查询。此外支持**会话活跃冻结 / 解除冻结**、按保留期的**到期批量清理**
+可随时查询。也可以直接提交 **RFC 5322 原始邮件头文本**（`POST /imports/rfc5322`，
+自动解析折行、重复字段与 RFC 2047 编码词）导入归档。此外支持**会话活跃冻结 /
+解除冻结**、按保留期的**到期批量清理**
 （删除中间节点时自动压缩会话树，支持 `dry_run` 预览）、**人工会话纠偏**
 （`POST /thread-corrections`，带 revision 乐观校验地调整任一有效邮件的父节点）、
 **会话响应时限评估**（`POST /thread-sla/evaluate`，只读地逐封判定整棵会话的
@@ -50,6 +52,7 @@ ports:
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `POST` | `/batches` | 提交一批邮件，返回会话树与全部诊断（HTTP 201） |
+| `POST` | `/imports/rfc5322` | **导入一组 RFC 5322 原始邮件头文本**，解析后归并归档为一批（HTTP 201，响应同 `/batches`） |
 | `GET` | `/batches?limit=50&offset=0` | 批次列表，按提交时间倒序 |
 | `GET` | `/batches/{batch_id}` | 取该批次的归档结果快照（与提交响应完全一致） |
 | `POST` | `/relinks` | 迟到邮件归档后，批量修复此前断链的有效邮件（HTTP 200） |
@@ -69,6 +72,7 @@ ports:
 不参与冻结与清理。
 
 未知 ID：批次 / 邮件查询、`/relinks` 返回 **404**；请求体不合法返回 **422**；
+`/imports/rfc5322` 任一头文本校验失败返回 **422**（逐项给出输入序号）且**不写库**；
 `/relinks` 若合并候选关系后形成环，整次返回 **409** 且不写库。冻结锚点未知
 返回 **404**，锚点为环内邮件返回 **409**；解除一个不存在的冻结返回 **404**。
 `POST /thread-sla/evaluate` 锚点邮件未知返回 **404**，锚点为环内邮件返回 **409**。
@@ -195,6 +199,53 @@ curl -X POST http://localhost:8000/batches \
 > 会话树节点（`threads` 与分页 `items`）沿用固定字段集，不内嵌
 > `retain_until` / 冻结状态——这两项通过 `GET /messages/{id}` 查询；批次快照
 > 的结构因此保持稳定，归档后永不改写。
+
+### RFC 5322 邮件头导入：`POST /imports/rfc5322`
+
+除了结构化 JSON（`/batches`），也可以直接提交**一组原始邮件头文本**导入归档。
+服务仅用 Python 标准库解析：折行（continuation line）自动拼接、重复字段经
+`get_all` 按出现顺序处理、RFC 2047 编码词（`=?charset?B/Q?...?=`）自动解码。
+
+- 请求体 `headers`：字符串数组，每项是一段完整邮件头文本（可含折行），
+  逐项解析为一封邮件；空数组返回 **422**；
+- 提取字段并归一为与 `/batches` 相同的批次模型：
+  - `Message-ID`（必填）：重复头与头内多个 `<...>` 候选均**按头中出现顺序**，
+    取首个非空候选；
+  - `In-Reply-To`（可选）：同样按出现顺序取首个候选；
+  - `References`（可选）：全部候选按出现顺序收集；
+  - `Date`（必填）：解析为发送时间，无时区按 UTC 处理；
+  - `Subject`（必填）：解码编码词并折叠折行空白，空主题视为非法；
+- 任一项的必填字段**缺失或格式非法**：整批返回 **422**，`detail.errors` 逐项
+  给出 **1 起始的输入序号**与该项全部错误，且**一项都不写库**；
+- 整批校验通过后复用现有归档服务**一次性写入**，响应与 `POST /batches`
+  完全一致（`BatchResult`，HTTP **201**），归并、诊断、快照语义不变。
+
+```bash
+# 服务监听 8000 端口
+curl -X POST http://localhost:8000/imports/rfc5322 \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "headers": [
+      "Message-ID: <A>\r\nDate: Fri, 18 Sep 2026 09:00:00 +0000\r\nSubject: =?UTF-8?Q?=E4=BE=8B=E4=BC=9A?=\r\n\t=?UTF-8?Q?meeting?=\r\n",
+      "Message-ID: <B>\r\nIn-Reply-To: <A>\r\nReferences: <A>\r\nDate: Fri, 18 Sep 2026 10:00:00 +0000\r\nSubject: Re: 例会meeting\r\n"
+    ]
+  }'
+```
+
+校验失败时（HTTP **422**，不写库）：
+
+```json
+{
+  "detail": {
+    "message": "invalid rfc5322 headers; nothing was imported",
+    "errors": [
+      {"index": 1, "errors": ["missing or malformed required header: Message-ID",
+                              "malformed Date header: 'not-a-date'"]},
+      {"index": 3, "errors": ["missing required header: Subject"]}
+    ]
+  }
+}
+```
 
 ### 迟到邮件补链：`POST /relinks`
 
