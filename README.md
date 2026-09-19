@@ -3,7 +3,10 @@
 批量提交邮件头信息（`message_id`、`in_reply_to`、`references`、发送时间、主题，
 以及可选的保留截止时间 `retain_until`），服务将其归并为**稳定排序的会话树**，
 并给出**重复 ID、缺失引用、引用环**三类诊断。批次请求与归并结果均持久化到 SQLite，
-可随时查询。此外支持**会话活跃冻结 / 解除冻结**、按保留期的**到期批量清理**
+可随时查询。除直接提交结构化字段（`POST /batches`）外，还支持
+**RFC 5322 原始邮件头导入**（`POST /imports/rfc5322`，用 Python 标准库解析折行、
+重复字段与 RFC 2047 编码词，解析通过后复用同一套归档逻辑一次性写入）。此外支持
+**会话活跃冻结 / 解除冻结**、按保留期的**到期批量清理**
 （删除中间节点时自动压缩会话树，支持 `dry_run` 预览）、**人工会话纠偏**
 （`POST /thread-corrections`，带 revision 乐观校验地调整任一有效邮件的父节点）、
 **会话响应时限评估**（`POST /thread-sla/evaluate`，只读地逐封判定整棵会话的
@@ -50,6 +53,7 @@ ports:
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `POST` | `/batches` | 提交一批邮件，返回会话树与全部诊断（HTTP 201） |
+| `POST` | `/imports/rfc5322` | **导入一组 RFC 5322 原始邮件头**：解析折行、重复字段与 RFC 2047 编码词，归一为批次模型后一次性归档（HTTP 201） |
 | `GET` | `/batches?limit=50&offset=0` | 批次列表，按提交时间倒序 |
 | `GET` | `/batches/{batch_id}` | 取该批次的归档结果快照（与提交响应完全一致） |
 | `POST` | `/relinks` | 迟到邮件归档后，批量修复此前断链的有效邮件（HTTP 200） |
@@ -195,6 +199,64 @@ curl -X POST http://localhost:8000/batches \
 > 会话树节点（`threads` 与分页 `items`）沿用固定字段集，不内嵌
 > `retain_until` / 冻结状态——这两项通过 `GET /messages/{id}` 查询；批次快照
 > 的结构因此保持稳定，归档后永不改写。
+
+### RFC 5322 原始邮件头导入：`POST /imports/rfc5322`
+
+不方便预先把邮件头拆成结构化字段时，可直接提交**一组 RFC 5322 原始头文本**
+（每个数组元素一封邮件，正文可带可不带——空行之后的内容一律忽略）。服务仅用
+Python 标准库（`email` + `policy.default`）解析并归一为与 `/batches` 完全一致的
+批次模型，随后**复用同一套归档服务**一次性写入，响应即标准 `BatchResult`。
+
+服务端口仍是 **8000**：
+
+```bash
+curl -X POST http://localhost:8000/imports/rfc5322 \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "headers": [
+      "Message-ID: <root@example.com>\r\nDate: Fri, 18 Sep 2026 08:00:00 +0000\r\nSubject: =?UTF-8?B?5L2g5aW9?= =?UTF-8?Q?=20World?=\r\n\r\n正文忽略\r\n",
+      "Message-ID: <reply@example.com>\nIn-Reply-To: <root@example.com>\nReferences: <root@example.com>\n\t<x@external>\nDate: Fri, 18 Sep 2026 17:30:00 +0800\nSubject: Re:\n =?UTF-8?B?5L2g5aW9?= World\n"
+    ]
+  }'
+```
+
+解析规则：
+
+- **折行（folding）**：CRLF 后接空格/制表符的续行自动展开（如第二条的
+  `References` 与 `Subject`）；
+- **RFC 2047 编码词**：`Subject` 等非结构化字段中的 `=?charset?b/q?…?=`
+  自动解码（第一条主题解码为 `你好 World`）；
+- **候选 ID**：`Message-ID`、`In-Reply-To`、`References` 均只取尖括号
+  token（`<local@domain>`）内的 msg-id，自动剥掉 CFWS（含嵌套注释、折行
+  空白），注释或引号里的伪尖括号不会误判；裸文本不作为候选；同一字段
+  （或多个同名字段行）出现多个候选时，**严格按头中出现顺序**处理：
+  `Message-ID` / `In-Reply-To` 取第一个合法候选，`References` 保留全部
+  合法候选（保序、不去重，与 `/batches` 语义一致）；
+- **时间归一**：`Date` 按 RFC 5322 解析，带偏移时换算为 UTC，无时区时按 UTC 处理；
+- 必填字段为 `Message-ID`、`Date`、`Subject`；`In-Reply-To`、`References` 可缺省。
+
+任一头文本缺失必填字段或字段格式非法，都会被**逐项**拒绝并返回 **422**，
+`errors` 中每项带有输入数组的下标 `index`（从 0 起）、`field`
+（`message_id` / `date` / `subject`）与 `code`（`missing` / `invalid`）；
+**整批校验通过前绝不写库**——任何一项失败，同次请求中的合法项也不会落库：
+
+```json
+{
+  "detail": {
+    "message": "one or more RFC 5322 header blocks are invalid; nothing was written",
+    "errors": [
+      {"index": 0, "field": "message_id", "code": "missing",
+       "message": "required header Message-ID is absent"},
+      {"index": 1, "field": "date", "code": "invalid",
+       "message": "Date is not a valid RFC 5322 date-time"}
+    ]
+  }
+}
+```
+
+全部通过后，导入批次与 `/batches` 提交的批次行为完全一致：同批重复 ID、跨批
+历史归档重复、缺失引用与引用环诊断均照常产生，可用 `GET /batches/{batch_id}`
+取回同一份快照。`headers` 为空数组返回 **422**。
 
 ### 迟到邮件补链：`POST /relinks`
 

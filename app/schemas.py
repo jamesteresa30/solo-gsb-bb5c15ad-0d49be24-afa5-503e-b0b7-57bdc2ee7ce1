@@ -51,6 +51,16 @@ class BatchIn(BaseModel):
     messages: list[MessageIn] = Field(..., min_length=1)
 
 
+class Rfc5322ImportIn(BaseModel):
+    """POST /imports/rfc5322：一组 RFC 5322 原始邮件头文本（按下标顺序归档）。"""
+
+    headers: list[str] = Field(
+        ...,
+        min_length=1,
+        description="每个元素是一封邮件的原始头文本（可含折行、重复字段、RFC 2047 编码词；空行后的正文忽略）",
+    )
+
+
 class RelinkIn(BaseModel):
     """POST /relinks：待补链的 message_id 列表。"""
 

@@ -20,6 +20,7 @@ from .schemas import (
     MessageOut,
     RelinkIn,
     RelinkResult,
+    Rfc5322ImportIn,
     ThreadCorrectionIn,
     ThreadCorrectionResult,
     ThreadNodeOut,
@@ -40,10 +41,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title=settings.app_title,
-    version="1.5.0",
+    version="1.6.0",
     description=(
         "批量提交邮件头信息，归并为稳定排序的会话树，诊断重复 ID / 缺失引用 / 引用环；"
-        "支持邮件保留期（retain_until）、会话活跃冻结/解除冻结与到期批量清理，"
+        "支持 RFC 5322 原始邮件头导入（POST /imports/rfc5322，解析折行、重复字段与 "
+        "RFC 2047 编码词）、邮件保留期（retain_until）、会话活跃冻结/解除冻结与到期批量清理，"
         "人工会话纠偏（POST /thread-corrections），"
         "会话响应时限评估（POST /thread-sla/evaluate，只读），"
         "以及会话主题漂移审计（POST /thread-subject-audit，只读）。"
@@ -66,6 +68,26 @@ def health() -> dict:
 )
 def submit_batch(payload: BatchIn) -> dict:
     return service.submit_batch(payload)
+
+
+@app.post(
+    "/imports/rfc5322",
+    response_model=BatchResult,
+    status_code=201,
+    tags=["imports"],
+    summary="导入一组 RFC 5322 原始邮件头，解析归一后一次性归档",
+)
+def import_rfc5322(payload: Rfc5322ImportIn) -> dict:
+    try:
+        return service.import_rfc5322(payload)
+    except service.Rfc5322ImportErrors as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "one or more RFC 5322 header blocks are invalid; nothing was written",
+                "errors": exc.errors,
+            },
+        )
 
 
 @app.get(

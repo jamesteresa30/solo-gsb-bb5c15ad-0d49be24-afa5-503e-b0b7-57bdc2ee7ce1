@@ -13,17 +13,28 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from . import database, threading
+from .rfc5322 import Rfc5322ParseError, parse_header_blocks
 from .schemas import (
     BatchIn,
     CleanupIn,
     FreezeIn,
+    MessageIn,
     RelinkIn,
+    Rfc5322ImportIn,
     ThreadCorrectionIn,
     ThreadSlaEvaluateIn,
     ThreadSubjectAuditIn,
     UnfreezeIn,
 )
 from .threading import RetentionCleanupPlan, ThreadMessage
+
+
+class Rfc5322ImportErrors(Exception):
+    """POST /imports/rfc5322：输入头文本存在字段错误（-> 422，不写库）。"""
+
+    def __init__(self, errors: list[dict]) -> None:
+        self.errors = errors
+        super().__init__(f"RFC 5322 import rejected with {len(errors)} field error(s)")
 
 
 class RelinkNotFound(Exception):
@@ -392,6 +403,34 @@ def submit_batch(payload: BatchIn) -> dict:
             raise
         finally:
             conn.close()
+
+
+def import_rfc5322(payload: Rfc5322ImportIn) -> dict:
+    """解析一组 RFC 5322 原始头并归一为现有批次模型后归档。
+
+    先对全部输入逐项解析（折行展开、重复字段按出现顺序处理、RFC 2047
+    编码词解码），任一输入缺失或含非法必填字段即抛
+    ``Rfc5322ImportErrors``（错误逐项带输入下标），**绝不写库**；全部
+    通过后构造 ``BatchIn`` 复用 submit_batch 的同一套归并、落库与快照
+    逻辑，一次性写入并返回 BatchResult。
+    """
+
+    try:
+        parsed = parse_header_blocks(payload.headers)
+    except Rfc5322ParseError as exc:
+        raise Rfc5322ImportErrors([e.as_dict() for e in exc.errors])
+
+    batch = BatchIn(messages=[
+        MessageIn(
+            message_id=item.message_id,
+            in_reply_to=item.in_reply_to,
+            references=list(item.references),
+            sent_at=item.sent_at,
+            subject=item.subject,
+        )
+        for item in parsed
+    ])
+    return submit_batch(batch)
 
 
 def _climb_root_inmem(
